@@ -4,7 +4,9 @@ public import vfile;
 import bindbc.zstandard;
 import etc.c.zlib;
 import std.digest;
+import std.digest.murmurhash;
 import std.bitmanip;
+import std.stdio;
 
 /**
  * DataPak (*.dpk) is mainly intended as a compression method for application assets. Technically it can store folder info,
@@ -28,8 +30,8 @@ public class DataPak{
 	 */
 	enum CompressionMethod : char[8]{
 		uncompressed		=	"UNCMPRSD",
-		deflate				=	"ZLIB    ",			///Last character can specify compression strength (0-9)
-		zstandard			=	"ZSTD    ",			///Last two characters can specify compression stength (00-20)
+		deflate				=	"ZLIB    ",			
+		zstandard			=	"ZSTD    ",			
 		//the following algorithms are not yet implemented, but probably will be
 		lz4					=	"LZ4     "
 	}
@@ -60,7 +62,8 @@ public class DataPak{
 			bool, "compIndex", 		1,	///If high, the idexes will be compressed
 			bool, "compExtField", 	1,	///If high, the extension field will be compressed
 			ubyte, "checksumType",	6,	///Type of checksum for the files
-			uint, "",				24,	///Reserved for future use
+			ubyte, "compLevel",		6,	///Compression level if needed
+			uint, "",				18,	///Reserved for future use
 		));
 		ubyte[4]	checksum;		///Murmurhash32/32 checksum for the header, extension field, and indexes. When processing, this field should set to all zeroes.
 	}
@@ -77,5 +80,83 @@ public class DataPak{
 		ubyte[16]	checksum;		///Per file checksum
 	}
 	protected Header header;
+	protected File file;
 	protected Index[] indexes;
+	protected ubyte[] extField;
+	protected ubyte[][uint] indexExtFields;
+	protected bool readOnly;
+	/**
+	 * Loads a DataPak file from disk for reading.
+	 */
+	public this(string filename){
+		this(File(filename));
+		readOnly = true;
+	}
+	///Ditto, but also can specify writing.
+	public this(ref File f){
+		ubyte[] readBuf;
+		MurmurHash3!(32, 32) chkSmCalc = MurmurHash3!(32, 32)(0x2E_68_50_4B);
+		readBuf.length = Header.sizeof;
+		f.rawRead(readBuf);
+		header = *(cast(Header*)(cast(void*)readBuf.ptr));
+		//ubyte[4] chkSm = header.checksum;
+		//header.checksum = [0x0, 0x0, 0x0, 0x0];
+		readBuf.length -= 4;
+		readBuf.length += 4;
+		file = f;
+		chkSmCalc.putElements(cast(uint[])(cast(void[])readBuf));
+		if(header.extFieldSize){
+			if(!header.compExtField){
+				extField.length = header.extFieldSize;
+				f.rawRead(extField);
+			}else{
+
+			}
+			chkSmCalc.putElements(cast(uint[])(cast(void[])extField));
+		}
+		if(!header.compIndex){
+			indexes.length = header.numOfIndexes;
+			readBuf.length = Index.sizeof;
+			for(int i; i < indexes.length; i++){
+				f.rawRead(readBuf);
+				indexes[i] = *(cast(Index*)(cast(void*)readBuf.ptr));
+				chkSmCalc.putElements(cast(uint[])(cast(void[])readBuf));
+				if(indexes[i].extFieldSize){
+					readBuf.length = indexes[i].extFieldSize;
+					f.rawRead(readBuf);
+					indexExtFields[i] = readBuf.dup;
+					chkSmCalc.putElements(cast(uint[])(cast(void[])readBuf));
+					readBuf.length = Index.sizeof;
+				}
+			}
+		}else{
+
+		}
+		const ubyte[4] checksum = chkSmCalc.finish();
+		if(header.checksum != checksum){
+			throw new BadChecksumException("Murmurhash3-32/32 error");
+		}
+		
+	}
+	/**
+	 * Decompresses a given amount from the file
+	 */
+	protected ubyte[] decompressFromFile(size_t amount){
+		switch(header.compMethod){
+			default:
+				throw new Exception("Unknown compression method");
+		}
+	}
+}
+
+public class BadChecksumException : Exception{
+	@nogc @safe pure nothrow this(string msg, string file = __FILE__, size_t line = __LINE__, Throwable nextInChain = null)
+    {
+        super(msg, file, line, nextInChain);
+    }
+
+    @nogc @safe pure nothrow this(string msg, Throwable nextInChain, string file = __FILE__, size_t line = __LINE__)
+    {
+        super(msg, file, line, nextInChain);
+    }
 }
