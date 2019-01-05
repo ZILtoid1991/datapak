@@ -1,0 +1,7 @@
+name "datapak"
+description "Data file archival with multiple options for compression"
+authors "Laszlo Szeremi"
+copyright "Copyright © 2019, Laszlo Szeremi"
+license "Boost"
+dependency "bindbc-zstandard" version="~>0.1.0"
+dependency "vfile" version="*"
