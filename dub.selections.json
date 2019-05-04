@@ -1,0 +1,9 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"bindbc-loader": "0.1.1",
+		"bindbc-zstandard": "0.2.0",
+		"darg": "0.1.0",
+		"vfile": "0.1.2"
+	}
+}
