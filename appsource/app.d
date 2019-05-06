@@ -18,16 +18,16 @@ struct Options{
 			packing files. If set on unpacking, then it'll specify the files that the user wants to unpack.")
 	string[] files;
 
-	@Argument("compMethod", Multiplicity.optional)
+	@Option("compMethod", "c")
 	@Help("Specifies the compression method when creating a new *.dpk file. Default is none. Currently supported
 			values are: none, deflate, zstd")
 	string compMethod = "none";
 
-	@Argument("compLevel", Multiplicity.optional)
+	@Option("compLevel", "l")
 	@Help("Specifies the compression level. Can be `fastest`, `default`, `max`, or a number within the range of the algorithm.")
 	string compLevel = "default";
 
-	@Argument("hash", Multiplicity.optional)
+	@Option("hash", "h")
 	@Help("Specifies the hash or checksum for the files. Default is none.")
 	string hashMethod = "none";
 

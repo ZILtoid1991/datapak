@@ -474,6 +474,19 @@ public class DataPak{
 		foreach(n, i; indexes){
 			this.compress(i.filename, i);
 		}
+		switch(header.compMethod){
+			case CompressionMethod.zstandard:
+				size_t remaining;
+				do{
+					remaining = ZSTD_endStream(cast(ZSTD_CStream*)compStream, &outBuff);
+					if(outBuff.size)
+						file.rawWrite(outBuff.dst[0..outBuff.pos]);
+					outBuff.pos = 0;
+				}while(remaining);
+				break;
+			default:
+				break;
+		}
 	}
 	/**
 	 * Compresses a single file into the stream.
@@ -499,39 +512,34 @@ public class DataPak{
 				}*/
 				break;
 			case CompressionMethod.zstandard:
-				size_t readSize, compSize;
+				size_t compSize;
+				readBuf.length = 32 * 1024;
 				do{
-					if (src.tell + readBuf.length >= src.size){
-						readSize = readBuf.length;
-						src.rawRead(readBuf);
-					} else if (src.size - src.tell){
-						readSize = cast(size_t)(src.size - src.tell);
-						src.rawRead(readBuf[0..readSize]);
-					}
+					readBuf = src.rawRead(readBuf);
 					inBuff.pos = 0;
-					inBuff.size = readSize;
+					inBuff.size = readBuf.length;
 					while(inBuff.pos < inBuff.size){
 						compSize = ZSTD_compressStream(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff);
 						if(ZSTD_isError(compSize)){
 							throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(compSize))));
 						}
 						//fwrite(outBuff.dst, compSize, 1, file);
-						file.rawWrite(outBuff.dst[0..compSize]);
+						if(compSize)
+							file.rawWrite(outBuff.dst[0..outBuff.pos]);
 						outBuff.pos = 0;
 					}
 					inBuff.size = readBuf.length;
-				}while(readSize);
+				}while(readBuf.length);
 				//Flush to disk
-				compSize = ZSTD_flushStream(cast(ZSTD_CStream*)compStream, &outBuff);
-				if(ZSTD_isError(compSize)){
-					throw new CompressionException(cast(string)fromStringz(ZSTD_getErrorName(compSize)));
-				}
-				if(compSize){
-					
-				}else{
-					//fwrite(outBuff.dst, outBuff.pos, 1, file);
-					file.rawWrite(outBuff.dst[0..outBuff.pos]);
-				}
+				do{
+					compSize = ZSTD_flushStream(cast(ZSTD_CStream*)compStream, &outBuff);
+					if(ZSTD_isError(compSize))
+						throw new CompressionException(cast(string)fromStringz(ZSTD_getErrorName(compSize)));
+					if(outBuff.pos)
+						file.rawWrite(outBuff.dst[0..outBuff.pos]);
+					outBuff.pos = 0;
+				}while(compSize);
+				
 				outBuff.pos = 0;
 				
 				break;
