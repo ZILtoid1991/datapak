@@ -516,6 +516,7 @@ public class DataPak{
 				readBuf.length = 32 * 1024;
 				do{
 					readBuf = src.rawRead(readBuf);
+					inBuff.src = readBuf.ptr;
 					inBuff.pos = 0;
 					inBuff.size = readBuf.length;
 					while(inBuff.pos < inBuff.size){
