@@ -568,7 +568,6 @@ public class DataPak{
 		ubyte[] output;
 		output.length = amount;
 		//size_t curAmount;
-		compPos += amount;
 		//writeln("compPos: ",compPos);
 		switch(header.compMethod){
 			case CompressionMethod.uncompressed://in this case, we just want to read regular data from file
@@ -584,14 +583,14 @@ public class DataPak{
 				ZSTD_outBuffer localOutBuf = ZSTD_outBuffer(output.ptr, output.length, 0);
 				//size_t prevPos;
 				do{
-					if(inBuff.size == inBuff.pos){
+					if(inBuff.size == inBuff.pos || !compPos){
 						inBuff.pos = 0;
 						//fread(readBuf.ptr, readBuf.length, 1, file);
-						file.rawRead(readBuf);
+						readBuf = file.rawRead(readBuf);
 						inBuff.src = readBuf.ptr;
 						inBuff.size = readBuf.length;
 					}
-					//writeln("localOutBuf.size: ",localOutBuf.size);
+					//writeln("readBuf.length: ",readBuf.length);
 					const size_t result = ZSTD_decompressStream(cast(ZSTD_DStream*)compStream, &localOutBuf, &inBuff);
 					//writeln("inBuff.size: ",inBuff.size);
 					if(ZSTD_isError(result)){
@@ -607,6 +606,7 @@ public class DataPak{
 			default:
 				throw new Exception("Unknown compression method");
 		}
+		compPos += amount;
 		readBuf.length = readBufferSize;
 		return output;
 	}
