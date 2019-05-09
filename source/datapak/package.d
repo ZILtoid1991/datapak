@@ -149,7 +149,8 @@ public class DataPak{
 
 	public pure void delegate(size_t pos) progress;	///Called to inform host on decompression process (will be replaced with something more useful in the future)
 
-	public static bool enableThrowOnChecksumError;	///Doesn't throw on errors, returns data regardless of error
+	public static bool enableThrowOnChecksumError = true;	///Doesn't throw on errors, returns data regardless of error
+	public static size_t readBufferSize = 32 * 1024; ///Sets the read buffer size of all instances (default is 32kB)
 	/**
 	 * Loads a DataPak file from disk for reading.
 	 */
@@ -179,13 +180,14 @@ public class DataPak{
 		//readBuf.length += 4;
 		file = f;
 		chkSmCalc.put(readBuf);
+		initDecomp;
 		if(header.extFieldSize){
 			if(!header.compExtField){
 				extField.length = header.extFieldSize;
 				//f.rawRead(extField);
 				extField = f.rawRead(extField);
 			}else{
-				initDecomp;
+				
 				f.rawRead(crc);
 				extField = decompressFromFile(header.extFieldSize);
 			}
@@ -211,7 +213,6 @@ public class DataPak{
 		}else{
 			if(!header.compExtField)
 				f.rawRead(crc);
-			initDecomp;
 			ubyte[] temp = decompressFromFile(header.indexSize);
 			ubyte* tempPtr = temp.ptr;
 			chkSmCalc.put(temp);
@@ -238,6 +239,7 @@ public class DataPak{
 		file = File(targetName, "wb");
 		this.header = header;
 		createNew = true;
+		initComp;
 	}
 	~this(){
 		//fclose(file);
@@ -344,11 +346,14 @@ public class DataPak{
 			case CompressionMethod.uncompressed:
 				break;
 			case CompressionMethod.zstandard:
-				compStream = ZSTD_createCStream;
-				const size_t result = ZSTD_initCStream(cast(ZSTD_CStream*)compStream, header.compLevel);
-				readBuf.length = result;
+				compStream = ZSTD_createCStream();
+				//const size_t result = ZSTD_initCStream(cast(ZSTD_CStream*)compStream, header.compLevel);
+				//readBuf.length = result;
+				ZSTD_CCtx_reset(cast(ZSTD_CStream*)compStream, ZSTD_ResetDirective.ZSTD_reset_session_only);
+				ZSTD_CCtx_setParameter(cast(ZSTD_CStream*)compStream, ZSTD_cParameter.ZSTD_c_compressionLevel, header.compLevel);
 				inBuff = ZSTD_inBuffer(readBuf.ptr, readBuf.length, 0);
-				compBuf.length = ZSTD_CStreamOutSize();
+				//compBuf.length = ZSTD_CStreamOutSize();
+				compBuf.length = readBufferSize;
 				outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
 				break;
 			default:
@@ -364,12 +369,13 @@ public class DataPak{
 			case CompressionMethod.uncompressed:
 				break;
 			case CompressionMethod.zstandard:
-				compStream = ZSTD_createDStream;
-				const size_t result = ZSTD_initDStream(cast(ZSTD_DStream*)compStream);
-				readBuf.length = result;
+				compStream = ZSTD_createDStream();
+				ZSTD_initDStream(cast(ZSTD_DStream*)compStream);
+				//writeln(result);
+				readBuf.length = readBufferSize;
 				inBuff = ZSTD_inBuffer(readBuf.ptr, readBuf.length, 0);
-				compBuf.length = ZSTD_DStreamOutSize();
-				outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
+				//compBuf.length = ZSTD_DStreamOutSize();
+				//outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
 				break;
 			default:
 				throw new Exception("Unknown compression method");
@@ -478,7 +484,7 @@ public class DataPak{
 			case CompressionMethod.zstandard:
 				size_t remaining;
 				do{
-					remaining = ZSTD_endStream(cast(ZSTD_CStream*)compStream, &outBuff);
+					remaining = ZSTD_compressStream2(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff, ZSTD_EndDirective.ZSTD_e_end);
 					if(outBuff.size)
 						file.rawWrite(outBuff.dst[0..outBuff.pos]);
 					outBuff.pos = 0;
@@ -496,15 +502,16 @@ public class DataPak{
 		switch(header.compMethod){
 			case CompressionMethod.uncompressed://in this case, we just want to copy the raw data into the file
 				ubyte[] buffer;
-				buffer.length = 32*1024;
+				buffer.length = readBufferSize;
 				/*while(src.tell + buffer.length >= src.size){
 					src.rawRead(buffer);
 					file.rawWrite(buffer);
 				}*/
 				do{
 					buffer = src.rawRead(buffer);
-					file.rawWrite(buffer);
-				}while(buffer.length == 32.1024);
+					if(buffer.length)
+						file.rawWrite(buffer);
+				}while(buffer.length == readBufferSize);
 				/*if(src.size - src.tell){
 					buffer.length = cast(size_t)(src.size - src.tell);
 					src.rawRead(buffer);
@@ -513,27 +520,29 @@ public class DataPak{
 				break;
 			case CompressionMethod.zstandard:
 				size_t compSize;
-				readBuf.length = 32 * 1024;
+				readBuf.length = readBufferSize;
 				do{
 					readBuf = src.rawRead(readBuf);
 					inBuff.src = readBuf.ptr;
 					inBuff.pos = 0;
 					inBuff.size = readBuf.length;
 					while(inBuff.pos < inBuff.size){
-						compSize = ZSTD_compressStream(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff);
+						compSize = ZSTD_compressStream2(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff, ZSTD_EndDirective.ZSTD_e_continue);
 						if(ZSTD_isError(compSize)){
 							throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(compSize))));
 						}
+						//writeln(source, ": ", compSize,"; ;",outBuff.pos);
 						//fwrite(outBuff.dst, compSize, 1, file);
-						if(compSize)
+						if(outBuff.pos)
 							file.rawWrite(outBuff.dst[0..outBuff.pos]);
 						outBuff.pos = 0;
 					}
 					inBuff.size = readBuf.length;
-				}while(readBuf.length);
+				}while(readBuf.length == readBufferSize);
 				//Flush to disk
 				do{
-					compSize = ZSTD_flushStream(cast(ZSTD_CStream*)compStream, &outBuff);
+					compSize = ZSTD_compressStream2(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff, ZSTD_EndDirective.ZSTD_e_flush);
+					//writeln(source, ": ", compSize,"; ",outBuff.pos);
 					if(ZSTD_isError(compSize))
 						throw new CompressionException(cast(string)fromStringz(ZSTD_getErrorName(compSize)));
 					if(outBuff.pos)
@@ -557,31 +566,39 @@ public class DataPak{
 	 */
 	protected ubyte[] decompressFromFile(const size_t amount){
 		ubyte[] output;
-		size_t curAmount;
+		output.length = amount;
+		//size_t curAmount;
 		compPos += amount;
+		//writeln("compPos: ",compPos);
 		switch(header.compMethod){
 			case CompressionMethod.uncompressed://in this case, we just want to read regular data from file
-				output.length = amount;
+				
 				//fread(output.ptr, output.length, 1, file);
-				file.rawRead(output);
+				output = file.rawRead(output);
+				if(output.length != amount)
+					throw new Exception("EOF reached earlier than expected from header/indexing");
 				break;
 			case CompressionMethod.zstandard:
 				//Try if we can get away with setting the output buffer the exact size a file needed, so we can avoid issues from overlapping decompression
-				output.length = amount;
+				//output.length = amount;
 				ZSTD_outBuffer localOutBuf = ZSTD_outBuffer(output.ptr, output.length, 0);
-				size_t prevPos;
+				//size_t prevPos;
 				do{
 					if(inBuff.size == inBuff.pos){
 						inBuff.pos = 0;
 						//fread(readBuf.ptr, readBuf.length, 1, file);
 						file.rawRead(readBuf);
+						inBuff.src = readBuf.ptr;
+						inBuff.size = readBuf.length;
 					}
+					//writeln("localOutBuf.size: ",localOutBuf.size);
 					const size_t result = ZSTD_decompressStream(cast(ZSTD_DStream*)compStream, &localOutBuf, &inBuff);
+					//writeln("inBuff.size: ",inBuff.size);
 					if(ZSTD_isError(result)){
 						throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(result))));
 					}else{
-						compPos += localOutBuf.pos - prevPos;
-						prevPos = localOutBuf.pos;
+						//compPos += localOutBuf.pos - prevPos;
+						//prevPos = localOutBuf.pos;
 					}
 				} while (localOutBuf.size > localOutBuf.pos);
 				break;
@@ -590,7 +607,23 @@ public class DataPak{
 			default:
 				throw new Exception("Unknown compression method");
 		}
+		readBuf.length = readBufferSize;
 		return output;
+	}
+
+	public static void loadZSTD(){
+		import bindbc.zstandard.dynload;
+		import bindbc.zstandard.config;
+		ZSTDSupport result = loadZstandard();
+		if(result == ZSTDSupport.noLibrary || result == ZSTDSupport.badLibrary)
+			throw new Exception("ZSTD not found!");
+	}
+	public static void loadZSTD(string lib){
+		import bindbc.zstandard.dynload;
+		import bindbc.zstandard.config;
+		ZSTDSupport result = loadZstandard(toStringz(lib));
+		if(result == ZSTDSupport.noLibrary || result == ZSTDSupport.badLibrary)
+			throw new Exception("ZSTD not found!");
 	}
 }
 
@@ -618,11 +651,11 @@ align(1):
  * Reinterprets an array as the requested type.
  */
 package T[] reinterpretCastA(T,U)(U[] input) pure @trusted{
-	T[] _reinterpretCastA(U[] i) pure @system{
+	T[] _reinterpretCastA() pure @system{
 		return cast(T[])(cast(void[])input);
 	}
 	if ((U.sizeof * input.length) % T.sizeof == 0)
-		return _reinterpretCastA(input);
+		return _reinterpretCastA();
 	else
 		throw new Exception("Reinterpretation error!");
 }
@@ -630,11 +663,11 @@ package T[] reinterpretCastA(T,U)(U[] input) pure @trusted{
  * Reinterprets an array as the requested type.
  */
 package T[] reinterpretCast(T,U)(U input) pure @trusted{
-	T[] _reinterpretCast(U i) pure @system{
+	T[] _reinterpretCast() pure @system{
 		return cast(T[])(cast(void[])[input]);
 	}
 	if (U.sizeof % T.sizeof == 0)
-		return _reinterpretCast(input);
+		return _reinterpretCast();
 	else
 		throw new Exception("Reinterpretation error!");
 	
@@ -643,11 +676,11 @@ package T[] reinterpretCast(T,U)(U input) pure @trusted{
  * Gets a certain type from an array.
  */
 package T reinterpretGet(T,U)(U[] input) pure @trusted{
-	T _reinterpretGet(U[] i) pure @system{
-		return *(cast(T*)(cast(void*)i.ptr));
+	T _reinterpretGet() pure @system{
+		return *(cast(T*)(cast(void*)input.ptr));
 	}
 	if (input.length == T.sizeof)
-		return _reinterpretGet(input);
+		return _reinterpretGet();
 	else
 		throw new Exception("Reinterpretation error!");
 }

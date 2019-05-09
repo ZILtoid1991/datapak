@@ -38,12 +38,17 @@ struct Options{
 	@Option("unpack", "u")
 	@Help("Unpacks a valid *.dpk file.")
 	string input;
+
+	@Option("destination", "d")
+	@Help("Specifies the destination folder for decompression.")
+	string dest;
 }
 
 immutable string help = helpString!Options();
 immutable string usage = usageString!Options("");
 
 int main (string[] args) {
+	DataPak.loadZSTD;
 	Options options;
 	writeln("Datapak archiver. \nby Laszlo Szeremi");
 	try {
@@ -60,13 +65,17 @@ int main (string[] args) {
     }
 
 	if (options.input) {
+		if(options.dest.length){
+			if(!(options.dest[$-1] == '/' || options.dest[$-1] == '\\'))
+				options.dest ~= '/';
+		}
 		try {
 			DataPak dpk = new DataPak(options.input);
 			//dpk.openDataStreamForReading();
 			DataPak.Index i = dpk.getNextIndex();
 			while (i.filename.length) {
 				writeln("Decompressing ", i.filename);
-				File output = File (i.filename, "wb");
+				File output = File (options.dest ~ i.filename, "wb");
 				output.rawWrite(dpk.getNextAsArray);
 				i = dpk.getNextIndex();
 			}
