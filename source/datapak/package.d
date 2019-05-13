@@ -6,6 +6,8 @@ import etc.c.zlib;
 import std.digest;
 import std.digest.murmurhash;
 import std.digest.md;
+import std.digest.sha;
+import std.digest.ripemd;
 import std.digest.crc;
 import std.bitmanip;
 import std.stdio;
@@ -60,13 +62,13 @@ public class DataPak{
 		sha512_256			=	10,
 		md5					=	11,
 		crc32				=	12,
-		crc64				=	13,///ISO only!
-
+		crc64ISO			=	13,
+		crc64ECMA			=	14
 	}
 	/**
 	 * Stores the length of each checksum result
 	 */
-	package static immutable ubyte[14] CHECKSUM_LENGTH = [0, 20, 4, 16, 16, 28, 32, 48, 64, 64, 64, 16, 4, 8];
+	package static immutable ubyte[15] CHECKSUM_LENGTH = [0, 20, 4, 16, 16, 28, 32, 48, 64, 28, 32, 16, 4, 8, 8];
 	/**
 	 * Stores important informations about the file.
 	 */
@@ -149,7 +151,9 @@ public class DataPak{
 
 	public pure void delegate(size_t pos) progress;	///Called to inform host on decompression process (will be replaced with something more useful in the future)
 
-	public static bool enableThrowOnChecksumError = true;	///Doesn't throw on errors, returns data regardless of error
+	//Configuration area, might be replaced with individual values instead of static ones.
+	public static bool enableHeaderChecksumError = true;	///If false, then it'll disable throw on header checksum mismatch
+	public static bool enableFileChecksumError = true;		///If false, then it'll disable throw on file checksum mismatch and calculation (useful when dealing with complex hash algorithms not designed for quick checksums)
 	public static size_t readBufferSize = 32 * 1024; ///Sets the read buffer size of all instances (default is 32kB)
 	/**
 	 * Loads a DataPak file from disk for reading.
@@ -227,7 +231,7 @@ public class DataPak{
 		}
 
 		const ubyte[4] checksum = chkSmCalc.finish();
-		if(crc != checksum && enableThrowOnChecksumError){
+		if(crc != checksum && enableHeaderChecksumError){
 			throw new BadChecksumException("CRC32 error in header/index");
 		}
 		
@@ -274,54 +278,56 @@ public class DataPak{
 		result.sizeH = cast(ushort)(f.size>>32);
 		//Calculate checksums if needed
 		size_t remain = cast(size_t)f.size;
+		ubyte[N] _generateChecksum(CHKSM, size_t N)(CHKSM checksum){
+			while(buffer.length){
+				buffer = f.rawRead(buffer);
+				checksum.put(buffer);
+			}
+			//checksum.finalize();
+			return checksum.finish();
+		}
 		switch(header.checksumType){
+			case ChecksumType.crc32:
+				result.checksum(_generateChecksum!(CRC32, 4)(CRC32()));
+				break;
+			case ChecksumType.crc64ECMA:
+				result.checksum(_generateChecksum!(CRC64ECMA, 8)(CRC64ECMA()));
+				break;
+			case ChecksumType.crc64ISO:
+				result.checksum(_generateChecksum!(CRC64ISO, 8)(CRC64ISO()));
+				break;
+			case ChecksumType.md5:
+				result.checksum(_generateChecksum!(MD5, 16)(MD5()));
+				break;
+			case ChecksumType.ripeMD:
+				result.checksum(_generateChecksum!(RIPEMD160, 20)(RIPEMD160()));
+				break;
+			case ChecksumType.sha224:
+				result.checksum(_generateChecksum!(SHA224, 28)(SHA224()));
+				break;
+			case ChecksumType.sha256:
+				result.checksum(_generateChecksum!(SHA256, 32)(SHA256()));
+				break;
+			case ChecksumType.sha384:
+				result.checksum(_generateChecksum!(SHA384, 48)(SHA384()));
+				break;
+			case ChecksumType.sha512:
+				result.checksum(_generateChecksum!(SHA512, 64)(SHA512()));
+				break;
+			case ChecksumType.sha512_224:
+				result.checksum(_generateChecksum!(SHA512_224, 28)(SHA512_224()));
+				break;
+			case ChecksumType.sha512_256:
+				result.checksum(_generateChecksum!(SHA512_256, 32)(SHA512_256()));
+				break;
 			case ChecksumType.murmurhash32_32:
-				MurmurHash3!(32,32) checksum = MurmurHash3!(32, 32)(0x66_69_6c_65);
-				while(remain > buffer.length){
-					f.rawRead(buffer);
-					checksum.put(buffer);
-					remain -= remain >= buffer.length ? buffer.length : remain;
-				}
-				if(remain){
-					buffer.length = remain;
-					f.rawRead(buffer);
-					checksum.put(buffer);
-				}
-				checksum.finalize();
-				const ubyte[4] chksRes = checksum.getBytes;
-				result.checksum(chksRes);
+				result.checksum(_generateChecksum!(MurmurHash3!(32, 32), 4)(MurmurHash3!(32, 32)(0x66_69_6c_65)));
 				break;
 			case ChecksumType.murmurhash128_32:
-				MurmurHash3!(128,32) checksum = MurmurHash3!(128, 32)(0x66_69_6c_65);
-				while(remain > buffer.length){
-					f.rawRead(buffer);
-					checksum.put(buffer);
-					remain -= remain >= buffer.length ? buffer.length : remain;
-				}
-				if(remain){
-					buffer.length = remain;
-					f.rawRead(buffer);
-					checksum.put(buffer);
-				}
-				checksum.finalize();
-				const ubyte[16] chksRes = checksum.getBytes;
-				result.checksum(chksRes);
+				result.checksum(_generateChecksum!(MurmurHash3!(128, 32), 16)(MurmurHash3!(128, 32)(0x66_69_6c_65)));
 				break;
 			case ChecksumType.murmurhash128_64:
-				MurmurHash3!(128,64) checksum = MurmurHash3!(128, 64)(0x66_69_6c_65);
-				while(remain > buffer.length){
-					f.rawRead(buffer);
-					checksum.put(buffer);
-					remain -= remain >= buffer.length ? buffer.length : remain;
-				}
-				if(remain){
-					buffer.length = remain;
-					f.rawRead(buffer);
-					checksum.put(buffer);
-				}
-				checksum.finalize();
-				const ubyte[16] chksRes = checksum.getBytes;
-				result.checksum(chksRes);
+				result.checksum(_generateChecksum!(MurmurHash3!(128, 64), 16)(MurmurHash3!(128, 64)(0x66_69_6c_65_66_69_6c_65L)));
 				break;
 			default:
 				break;
@@ -329,9 +335,9 @@ public class DataPak{
 		result.offset = compPos;
 		compPos += f.size;
 		result.extFieldSize = cast(ushort)indexExtField.length;
-		indexes ~= result;
 		if(indexExtField.length)
-			indexExtFields[cast(uint)(indexes.length - 1)] = indexExtField;
+			indexExtFields[cast(uint)indexes.length] = indexExtField;
+		indexes ~= result;
 		header.decompSize += f.size;
 		header.indexSize += Index.sizeof + indexExtField.length;
 		header.numOfIndexes = cast(uint)indexes.length;
@@ -422,31 +428,46 @@ public class DataPak{
 		return result;
 	}
 	/**
-	 * Checks the integrity of a file.
+	 * Checks the integrity of a file against a hash or checksum.
 	 */
 	protected bool checkFile(ubyte[] data, ubyte[] checksum){
+		bool _checkFile (CHKSM)(CHKSM chkCalc) {
+			chkCalc.put(data);
+			immutable auto result = chkCalc.finish;
+			if (result == checksum)
+				return true;
+			else
+				return false;
+		}
 		switch(header.checksumType){
+			case ChecksumType.ripeMD:
+				return _checkFile(RIPEMD160());
+			case ChecksumType.md5:
+				return _checkFile(MD5());
+			case ChecksumType.crc32:
+				return _checkFile(CRC32());
+			case ChecksumType.crc64ISO:
+				return _checkFile(CRC64ISO());
+			case ChecksumType.crc64ECMA:
+				return _checkFile(CRC64ECMA());
+			case ChecksumType.sha224:
+				return _checkFile(SHA224());
+			case ChecksumType.sha256:
+				return _checkFile(SHA256());
+			case ChecksumType.sha384:
+				return _checkFile(SHA384());
+			case ChecksumType.sha512:
+				return _checkFile(SHA512());
+			case ChecksumType.sha512_224:
+				return _checkFile(SHA512_224());
+			case ChecksumType.sha512_256:
+				return _checkFile(SHA512_256());
 			case ChecksumType.murmurhash32_32:
-				MurmurHash3!(32,32) chkCalc = MurmurHash3!(32, 32)(0x66_69_6c_65);
-				chkCalc.put(data);
-				const ubyte[4] result = chkCalc.finish;
-				if(result != checksum)
-					return false;
-				return true;
+				return _checkFile(MurmurHash3!(32,32)(0x66_69_6c_65));
 			case ChecksumType.murmurhash128_32:
-				MurmurHash3!(128,32) chkCalc = MurmurHash3!(128, 32)(0x66_69_6c_65);
-				chkCalc.put(data);
-				const ubyte[16] result = chkCalc.finish;
-				if(result != checksum)
-					return false;
-				return true;
+				return _checkFile(MurmurHash3!(128,32)(0x66_69_6c_65));
 			case ChecksumType.murmurhash128_64:
-				MurmurHash3!(128,64) chkCalc = MurmurHash3!(128, 64)(0x66_69_6c_65);
-				chkCalc.put(data);
-				const ubyte[16] result = chkCalc.finish;
-				if(result != checksum)
-					return false;
-				return true;
+				return _checkFile(MurmurHash3!(128,64)(0x66_69_6c_65_66_69_6c_65L));
 			default:
 				return true;
 		}
@@ -634,18 +655,32 @@ unittest{
 	assert(index.filename == "something");
 }
 /**
- * Default extension for adding general support for using it as a regular file archival tool
+ * Default extension for adding general support for using it as a regular file archival tool.
+ * This does not contain user-privilege settings, those are relegated to another struct. 
  */
 struct DataPak_OSExt{
 align(1):
 	char[6]		id = "OSExt ";			///Identifies that this field is a DataPak_OSExt struct
-	ushort		size = 256;				///Size of this field
-	char[160]	path;					///Stores the relative path of the file
-	char[32]	ownerUserID;			///Owner's ID on POSIX systems
-	char[32]	ownerUserGroup;			///Owner's group on POSIX systems
+	ushort		size = DataPak_OSExt.sizeof;	///Size of this field
+	char[200]	nameExt;				///Stores filename extension + relative path
 	ulong		creationDate;			///Creation date in 64 bit POSIX time format
 	ulong		modifyDate;				///Modification date in 64 bit POSIX time format
 	ulong		field;					///Unused by default, can store attributes if needed
+}
+/**
+ * Default extension for adding support for compression algorithms that support random access
+ */
+struct DataPak_RandomAccessExt{
+align(1):
+	char[6]		id = "RandAc";			///Identifies that this field is a DataPak_RandomAccessExt struct
+	ushort		size = DataPak_RandomAccessExt.sizeof;	///Size of this field
+	ulong		position;				///Position of file
+	union{
+		ulong[2]	field64;
+		uint[4]		field32;
+		ushort[8]	field16;
+		ubyte[16]	field8;
+	}
 }
 /**
  * Reinterprets an array as the requested type.

@@ -27,7 +27,7 @@ struct Options{
 	@Help("Specifies the compression level. Can be `fastest`, `default`, `max`, or a number within the range of the algorithm.")
 	string compLevel = "default";
 
-	@Option("hash", "h")
+	@Option("hash", "s")
 	@Help("Specifies the hash or checksum for the files. Default is none.")
 	string hashMethod = "none";
 
@@ -139,6 +139,55 @@ int main (string[] args) {
 				break;
 			default:
 				writeln("Unknown compression method.");
+				return 1;
+		}
+		switch (options.hashMethod){
+			case "none":
+				break;
+			case "ripeMD":
+				header.checksumType = DataPak.ChecksumType.ripeMD;
+				break;
+			case "murmurhash32_32", "murmurhash32/32":
+				header.checksumType = DataPak.ChecksumType.murmurhash32_32;
+				break;
+			case "murmurhash128_32", "murmurhash128/32":
+				header.checksumType = DataPak.ChecksumType.murmurhash128_32;
+				break;
+			case "murmurhash128_64", "murmurhash128/64":
+				header.checksumType = DataPak.ChecksumType.murmurhash128_64;
+				break;
+			case "sha224":
+				header.checksumType = DataPak.ChecksumType.sha224;
+				break;
+			case "sha256":
+				header.checksumType = DataPak.ChecksumType.sha256;
+				break;
+			case "sha384":
+				header.checksumType = DataPak.ChecksumType.sha384;
+				break;
+			case "sha512":
+				header.checksumType = DataPak.ChecksumType.sha512;
+				break;
+			case "sha512_224", "sha512/224":
+				header.checksumType = DataPak.ChecksumType.sha512_224;
+				break;
+			case "sha512_256", "sha512/256":
+				header.checksumType = DataPak.ChecksumType.sha512_256;
+				break;
+			case "md5":
+				header.checksumType = DataPak.ChecksumType.md5;
+				break;
+			case "crc32":
+				header.checksumType = DataPak.ChecksumType.crc32;
+				break;
+			case "crc64ISO":
+				header.checksumType = DataPak.ChecksumType.crc64ISO;
+				break;
+			case "crc64ECMA":
+				header.checksumType = DataPak.ChecksumType.crc64ECMA;
+				break;
+			default:
+				writeln("Unknown hash/checksum method.");
 				return 1;
 		}
 		header.numOfIndexes = cast(uint)options.files.length;
