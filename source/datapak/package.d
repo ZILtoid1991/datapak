@@ -2,7 +2,7 @@ module datapak;
 
 public import vfile;
 import bindbc.zstandard.zstd;
-import etc.c.zlib;
+import zlib = etc.c.zlib;
 import std.digest;
 import std.digest.murmurhash;
 import std.digest.md;
@@ -143,6 +143,7 @@ public class DataPak{
 	protected ubyte[][uint] indexExtFields;
 	protected bool readOnly, createNew;
 	protected void* compStream;
+	protected zlib.z_stream deflateStream;
 	protected ubyte[] readBuf, compBuf;
 	protected ZSTD_inBuffer inBuff;
 	protected ZSTD_outBuffer outBuff;
@@ -256,6 +257,8 @@ public class DataPak{
 					ZSTD_freeDStream(cast(ZSTD_DStream*)compStream);
 				}
 				break;
+			case CompressionMethod.deflate:
+				break;
 			default:	
 				break;
 		}
@@ -354,13 +357,23 @@ public class DataPak{
 			case CompressionMethod.zstandard:
 				compStream = ZSTD_createCStream();
 				//const size_t result = ZSTD_initCStream(cast(ZSTD_CStream*)compStream, header.compLevel);
-				//readBuf.length = result;
+				readBuf.length = readBufferSize;
 				ZSTD_CCtx_reset(cast(ZSTD_CStream*)compStream, ZSTD_ResetDirective.ZSTD_reset_session_only);
 				ZSTD_CCtx_setParameter(cast(ZSTD_CStream*)compStream, ZSTD_cParameter.ZSTD_c_compressionLevel, header.compLevel);
 				inBuff = ZSTD_inBuffer(readBuf.ptr, readBuf.length, 0);
 				//compBuf.length = ZSTD_CStreamOutSize();
 				compBuf.length = readBufferSize;
 				outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
+				break;
+			case CompressionMethod.deflate:
+				if(zlib.Z_OK != zlib.deflateInit(&deflateStream, header.compLevel))
+					throw new CompressionException("Failed to initialize deflate.");
+				readBuf.length = readBufferSize;
+				deflateStream.avail_in = cast(uint)readBuf.length;
+				deflateStream.next_in = readBuf.ptr;
+				compBuf.length = readBufferSize;
+				deflateStream.avail_out = cast(uint)compBuf.length;
+				deflateStream.next_out = compBuf.ptr;
 				break;
 			default:
 				throw new Exception("Unknown compression method");
@@ -382,6 +395,13 @@ public class DataPak{
 				inBuff = ZSTD_inBuffer(readBuf.ptr, readBuf.length, 0);
 				//compBuf.length = ZSTD_DStreamOutSize();
 				//outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
+				break;
+			case CompressionMethod.deflate:
+				if(zlib.Z_OK != zlib.inflateInit(&deflateStream))
+					throw new CompressionException("Failed to initialize deflate");
+				readBuf.length = readBufferSize;
+				deflateStream.next_in = readBuf.ptr;
+				deflateStream.avail_in = cast(uint)readBuf.length;
 				break;
 			default:
 				throw new Exception("Unknown compression method");
@@ -501,15 +521,32 @@ public class DataPak{
 		foreach(n, i; indexes){
 			this.compress(i.filename, i);
 		}
-		switch(header.compMethod){
+		switch (header.compMethod) {
 			case CompressionMethod.zstandard:
 				size_t remaining;
-				do{
+				do {
 					remaining = ZSTD_compressStream2(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff, ZSTD_EndDirective.ZSTD_e_end);
 					if(outBuff.size)
 						file.rawWrite(outBuff.dst[0..outBuff.pos]);
 					outBuff.pos = 0;
-				}while(remaining);
+				} while (remaining);
+				break;
+			case CompressionMethod.deflate:
+				int result;
+				//finish compression and flush whatever is remaining in the buffers
+				do {
+					result = zlib.deflate(&deflateStream, zlib.Z_FINISH);
+					if (!deflateStream.avail_out) {	//write to disk if output buffer is full
+						file.rawWrite(compBuf);
+						deflateStream.avail_out = cast(uint)compBuf.length;
+						deflateStream.next_out = compBuf.ptr;
+					}
+				} while (result != zlib.Z_STREAM_END);
+				if (deflateStream.avail_out != compBuf.length) {
+					file.rawWrite(compBuf[0..$-deflateStream.avail_out]);
+					deflateStream.avail_out = cast(uint)compBuf.length;
+					deflateStream.next_out = compBuf.ptr;
+				}
 				break;
 			default:
 				break;
@@ -542,14 +579,14 @@ public class DataPak{
 			case CompressionMethod.zstandard:
 				size_t compSize;
 				readBuf.length = readBufferSize;
-				do{
+				do {
 					readBuf = src.rawRead(readBuf);
 					inBuff.src = readBuf.ptr;
 					inBuff.pos = 0;
 					inBuff.size = readBuf.length;
-					while(inBuff.pos < inBuff.size){
+					while (inBuff.pos < inBuff.size) {
 						compSize = ZSTD_compressStream2(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff, ZSTD_EndDirective.ZSTD_e_continue);
-						if(ZSTD_isError(compSize)){
+						if (ZSTD_isError(compSize)) {
 							throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(compSize))));
 						}
 						//writeln(source, ": ", compSize,"; ;",outBuff.pos);
@@ -559,9 +596,9 @@ public class DataPak{
 						outBuff.pos = 0;
 					}
 					inBuff.size = readBuf.length;
-				}while(readBuf.length == readBufferSize);
+				} while(readBuf.length == readBufferSize);
 				//Flush to disk
-				do{
+				do {
 					compSize = ZSTD_compressStream2(cast(ZSTD_CStream*)compStream, &outBuff, &inBuff, ZSTD_EndDirective.ZSTD_e_flush);
 					//writeln(source, ": ", compSize,"; ",outBuff.pos);
 					if(ZSTD_isError(compSize))
@@ -569,12 +606,32 @@ public class DataPak{
 					if(outBuff.pos)
 						file.rawWrite(outBuff.dst[0..outBuff.pos]);
 					outBuff.pos = 0;
-				}while(compSize);
+				} while(compSize);
 				
 				outBuff.pos = 0;
 				
 				break;
 			case CompressionMethod.deflate:
+				readBuf.length = readBufferSize;
+				do {
+					readBuf = src.rawRead(readBuf);
+					deflateStream.avail_in = cast(uint)readBuf.length;
+					deflateStream.next_in = readBuf.ptr;
+					do {
+						int result;
+						if(readBuf.length == readBufferSize)
+							result = zlib.deflate(&deflateStream, zlib.Z_FULL_FLUSH);
+						else
+							result = zlib.deflate(&deflateStream, zlib.Z_SYNC_FLUSH);
+						if (result < 0)
+							throw new CompressionException(cast(string)(fromStringz(deflateStream.msg)));
+						if (!deflateStream.avail_out) {	//write to disk if output buffer is full
+							file.rawWrite(compBuf);
+							deflateStream.avail_out = cast(uint)compBuf.length;
+							deflateStream.next_out = compBuf.ptr;
+						}
+					} while (deflateStream.avail_in);
+				} while (readBuf.length == readBufferSize);
 				break;
 			default:
 				//fclose(src);
@@ -585,12 +642,12 @@ public class DataPak{
 	/**
 	 * Decompresses a given amount from the file from the current position.
 	 */
-	protected ubyte[] decompressFromFile(const size_t amount){
+	protected ubyte[] decompressFromFile (const size_t amount) {
 		ubyte[] output;
 		output.length = amount;
 		//size_t curAmount;
 		//writeln("compPos: ",compPos);
-		switch(header.compMethod){
+		switch (header.compMethod) {
 			case CompressionMethod.uncompressed://in this case, we just want to read regular data from file
 				
 				//fread(output.ptr, output.length, 1, file);
@@ -603,26 +660,36 @@ public class DataPak{
 				//output.length = amount;
 				ZSTD_outBuffer localOutBuf = ZSTD_outBuffer(output.ptr, output.length, 0);
 				//size_t prevPos;
-				do{
-					if(inBuff.size == inBuff.pos || !compPos){
+				do {
+					if (inBuff.size == inBuff.pos || !compPos) {
 						inBuff.pos = 0;
-						//fread(readBuf.ptr, readBuf.length, 1, file);
 						readBuf = file.rawRead(readBuf);
 						inBuff.src = readBuf.ptr;
 						inBuff.size = readBuf.length;
 					}
-					//writeln("readBuf.length: ",readBuf.length);
 					const size_t result = ZSTD_decompressStream(cast(ZSTD_DStream*)compStream, &localOutBuf, &inBuff);
-					//writeln("inBuff.size: ",inBuff.size);
-					if(ZSTD_isError(result)){
+					if(ZSTD_isError(result))
 						throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(result))));
-					}else{
-						//compPos += localOutBuf.pos - prevPos;
-						//prevPos = localOutBuf.pos;
-					}
+					
 				} while (localOutBuf.size > localOutBuf.pos);
 				break;
 			case CompressionMethod.deflate:
+				deflateStream.next_out = output.ptr;
+				deflateStream.avail_out = cast(uint)output.length;
+				int result;
+				do {
+					if (!deflateStream.avail_in || !compPos) {
+						readBuf = file.rawRead(readBuf);
+						deflateStream.next_in = readBuf.ptr;
+						deflateStream.avail_in = cast(uint)readBuf.length;
+					}
+					//if(readBuf.length == readBufferSize)
+					result = zlib.inflate(&deflateStream, zlib.Z_FULL_FLUSH);
+					/+else
+						result = zlib.inflate(&deflateStream, zlib.Z_SYNC_FLUSH);+/
+					/+if(result < 0)
+						throw new CompressionException(cast(string)(fromStringz(deflateStream.msg)));+/
+				} while (deflateStream.avail_out);
 				break;
 			default:
 				throw new Exception("Unknown compression method");
@@ -632,18 +699,18 @@ public class DataPak{
 		return output;
 	}
 
-	public static void loadZSTD(){
+	public static void loadZSTD () {
 		import bindbc.zstandard.dynload;
 		import bindbc.zstandard.config;
 		ZSTDSupport result = loadZstandard();
-		if(result == ZSTDSupport.noLibrary || result == ZSTDSupport.badLibrary)
+		if (result == ZSTDSupport.noLibrary || result == ZSTDSupport.badLibrary)
 			throw new Exception("ZSTD not found!");
 	}
-	public static void loadZSTD(string lib){
+	public static void loadZSTD (string lib) {
 		import bindbc.zstandard.dynload;
 		import bindbc.zstandard.config;
 		ZSTDSupport result = loadZstandard(toStringz(lib));
-		if(result == ZSTDSupport.noLibrary || result == ZSTDSupport.badLibrary)
+		if (result == ZSTDSupport.noLibrary || result == ZSTDSupport.badLibrary)
 			throw new Exception("ZSTD not found!");
 	}
 }
@@ -656,9 +723,9 @@ unittest{
 }
 /**
  * Default extension for adding general support for using it as a regular file archival tool.
- * This does not contain user-privilege settings, those are relegated to another struct. 
+ * This does not contain user-privilege settings, those will be relegated to another struct. 
  */
-struct DataPak_OSExt{
+struct DataPak_OSExt {
 align(1):
 	char[6]		id = "OSExt ";			///Identifies that this field is a DataPak_OSExt struct
 	ushort		size = DataPak_OSExt.sizeof;	///Size of this field
@@ -666,6 +733,24 @@ align(1):
 	ulong		creationDate;			///Creation date in 64 bit POSIX time format
 	ulong		modifyDate;				///Modification date in 64 bit POSIX time format
 	ulong		field;					///Unused by default, can store attributes if needed
+	///Sets the name extension of the file
+	public string name(string val) @safe @property @nogc nothrow pure{
+		for (size_t i ; i < nameExt.length ; i++)
+			nameExt[i] = 0xFF;
+		foreach (i , c ; val)
+			nameExt[i] = c;
+		return val;
+	}
+	///Gets the name extension of the file
+	public string name() @safe @property nothrow pure{
+		string result;
+		size_t pos;
+		while(nameExt.length > pos && nameExt[pos] != 0xFF){
+			result ~= nameExt[pos];
+			pos++;
+		}
+		return result;
+	}
 }
 /**
  * Default extension for adding support for compression algorithms that support random access
