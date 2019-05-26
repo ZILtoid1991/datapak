@@ -1,3 +1,10 @@
+/*
+ * Datapak
+ * Created by Laszlo Szeremi in 2019
+ *
+ * Copyright under Boost Software License
+ */
+
 module datapak;
 
 public import vfile;
@@ -218,7 +225,7 @@ public class DataPak{
 		}else{
 			if(!header.compExtField)
 				f.rawRead(crc);
-			ubyte[] temp = decompressFromFile(header.indexSize);
+			ubyte[] temp = decompressFromFile(cast(size_t)(header.indexSize));
 			ubyte* tempPtr = temp.ptr;
 			chkSmCalc.put(temp);
 			for(int i; i < indexes.length; i++){
