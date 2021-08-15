@@ -8,66 +8,58 @@
 module datapak;
 
 public import vfile;
+public import datapak.exceptions;
 import bindbc.zstandard.zstd;
 import zlib = etc.c.zlib;
 import std.digest;
-import std.digest.murmurhash;
-import std.digest.md;
-import std.digest.sha;
-import std.digest.ripemd;
 import std.digest.crc;
 import std.bitmanip;
 import std.stdio;
 import std.string : toStringz, fromStringz;
+import bitleveld.reinterpret;
 
 /**
  * DataPak (*.dpk) is mainly intended as a compression method for application assets. Technically it can store folder info,
- * but the fixed filename length is shorter to save some extra space. There's some support for expanding the path, but
- * currently unimplemented.
+ * but the fixed filename length is shorter to save some extra space alongside with other missing info (creation date, etc).
+ * Standard extensions can give these functionalities back.
  * 
  * General layout of a file:
  * <ul>
  * <li>DataPak signature</li>
  * <li>Header</li>
- * <li>Extension area. Ignored by default, handling must be implemented by whoever wants to use it. Can be compressed alongside with the main
- * data to save some space (not recommended if it's needed for compression, e.g. dictionaries), but only if the index field is also compressed.</li>
+ * <li>Extension area. Certain extensions might help decompress the file (e.g. decompression dictionaries), everything else is ignored
+ * here by default, and the end user must implement handling of them.</li>
  * <li>Array of DataPak indexes. Each entry can have some extension. Can be compressed alongside with the main data to save some space.</li>
  * <li>CRC32 checksum at the begining of compressed block or at the end of file information description table.</li>
  * <li>Data</li>
  * </ul>
  */
-public class DataPak{
+public class DataPak {
 	///Every DataPak file begins with this.
 	///The dot will be replaced with numbers if I ever decide to make any upgrades to the format
-	static enum char[8] SIGNATURE = "DataPak.";		
+	static enum char[8] SIGNATURE = "DataPak.";
+	///Standard extensions recognized by the format.
+	enum StandardExtensions : char[8] {
+		CompressionDict		=	"CMPRDICT",
+		ExtCmprDictFile		=	"CMPRDEXF"
+	}
 	/**
 	 * Default compression methods for the file.
 	 */
-	enum CompressionMethod : char[8]{
+	enum CompressionMethod : char[8] {
 		uncompressed		=	"UNCMPRSD",
 		deflate				=	"ZLIB    ",			
-		zstandard			=	"ZSTD    ",			
+		zstandard			=	"ZSTD    ",	
+		zstandardWDict		=	"ZSTD+D  ",	
 		//the following algorithms are not yet implemented, but probably will be
 		lz4					=	"LZ4     "
 	}
 	/**
 	 * Selects between checksums.
-	 * Please note that the more bytes the checksum needs, the less will be left for the filename.
-	 * Values between 32-63 can be used for custom implementations.
+	 * Only crc32 and two types of crc64 are supported in the final version.
 	 */
 	public enum ChecksumType : ubyte{
 		none				=	0,
-		ripeMD				=	1,
-		murmurhash32_32		=	2,
-		murmurhash128_32	=	3,
-		murmurhash128_64	=	4,
-		sha224				=	5,
-		sha256				=	6,
-		sha384				=	7,
-		sha512				=	8,
-		sha512_224			=	9,
-		sha512_256			=	10,
-		md5					=	11,
 		crc32				=	12,
 		crc64ISO			=	13,
 		crc64ECMA			=	14
@@ -79,10 +71,9 @@ public class DataPak{
 	/**
 	 * Stores important informations about the file.
 	 */
-	public struct Header{
+	public struct Header {
 	align(1):
 		ulong		indexSize;		///Size of the index field in bytes, including the extension fields
-		ulong		decompSize;		///Total decompressed size
 		char[8]		compMethod;		///Compression method stored as a string
 		uint		extFieldSize;	///Extension area size
 		uint		numOfIndexes;	///Total number of file indexes
@@ -91,42 +82,62 @@ public class DataPak{
 			bool, "compExtField", 	1,	///If high, the extension field will be compressed
 			ubyte, "checksumType",	6,	///Type of checksum for the files
 			ubyte, "compLevel",		6,	///Compression level if needed
-			uint, "",				18,	///Reserved for future use
+			bool, "perFileComp",	1,	///Per-file compression, mainly recommended with dictionary-type compressors
+			/**
+			 * Sets the limit of the Datapak file.
+			 * 0: No limits, only technological ones. File chaining is disabled.
+			 * 1: FAT32 limit (4GB).
+			 * 2: ISO9660 limit (2GB).
+			 * 3-7: 1GB or less, based on the power of two.
+			 */
+			ubyte, "filesizeLimit",	3,
+			ushort, "reserved",		14,	///Reserved for future use
 		));
 		//uint		padding;
 	}
 	/**
+	 * Header extension field identifiers
+	 */
+	public struct HeaderExt {
+	align(1):
+		char[8]		signature;		///Identifier of the extension field.
+		uint		size;			///Size of the extension field, including these fields.
+	}
+	/**
 	 * Index representing data for a file.
 	 */
-	public struct Index{
+	public struct Index {
 	align(1):
-		ulong 		offset;			///Points to where the file begins in the decompressed stream
-		ushort		extFieldSize;	///Extension area size for the index
-		ushort		sizeH;			///The upper 16 bits of the file's size
-		uint		sizeL;			///The lower 32 bits of the file's size
-		char[112]	field;			///Name of the file terminated with a null character + checksum in the end
+		/**
+		 * Points to where the file begins in the stream.
+		 * In case of files compressed at once or uncompressed files, the offset points to the location in the decompressed stream.
+		 * In case of individually compressed files, the offset points to the location of the compressed data.
+		 */
+		ulong 		offset;			
+		ulong		uncompSize;			///Uncompressed size of the file
+		ulong		compSize;			///Compressed size of the file, or the same as the previous field if uncompressed, or zero if archive is not random access
+		uint		extFieldSize;		///Index extension field size
+		char[100]	field;				///Name of the file terminated with a null character + checksum in the end (CRC32 or CRC64)
 		///Returns the filename into a string
-		public @property string filename() @safe pure nothrow{
+		public @property string filename() @safe pure nothrow {
 			string result;
 			size_t pos;
-			while(field.length > pos && field[pos] != 0xFF){
+			while(field.length > pos && field[pos] != 0){
 				result ~= field[pos];
 				pos++;
 			}
 			return result;
 		}
 		///Sets the filename
-		public @property string filename(string val) @safe @nogc pure nothrow{
-			/*for(int i ; i < val.length && i < field.length ; i++){
-				field[i] = val[i];
-			}*/
-			foreach(i , c ; val){
+		public @property string filename(string val) @safe @nogc pure nothrow {
+			foreach(size_t i , char c ; val){
 				field[i] = c;
 			}
+			field[val.length] = 0x00;
 			return val;
 		}
 		///Returns the checksum/hash
-		public ubyte[N] checksum(int N = 16)() @safe @nogc pure nothrow{
+		public ubyte[N] checksum(int N = 4)() @safe @nogc pure nothrow {
 			ubyte[N] result;
 			for(int i ; i < N ; i++){
 				result[i] = field[field.length - N + i];
@@ -134,110 +145,143 @@ public class DataPak{
 			return result;
 		}
 		///Sets the checksum/hash
-		public ubyte[N] checksum(int N = 16)(ubyte[N] val) @safe @nogc pure nothrow{
+		public ubyte[N] checksum(int N = 4)(ubyte[N] val) @safe @nogc pure nothrow {
 			for(int i ; i < N ; i++){
 				field[field.length - N + i] = val[i];
 			}
 			return val;
 		}
 	}
-	protected Header header;
-	protected File file;
-	protected Index[] indexes;
+	/**
+	 * Index extension identifier.
+	 */
+	public struct IndexExt {
+	align(1):
+		char[6]		signature;		///Identification of the extension field.
+		ushort		size;			///Size of this extension field, including these fields.
+	}
+	protected Header header;			///File header
+	protected File file;				///Filestream
+	protected Index[] indexes;			///File indexes
 	protected string[] paths;			///Only used during compression
 	protected uint nextIndex;
-	protected ubyte[] extField;
-	protected ubyte[][uint] indexExtFields;
+	protected ubyte[][] extField;
+	protected ubyte[][][uint] indexExtFields;
 	protected bool readOnly, createNew;
-	protected void* compStream;
+	protected void* compStream, compDict;
 	protected zlib.z_stream deflateStream;
-	protected ubyte[] readBuf, compBuf;
+	protected ubyte[] readBuf, compBuf, dictionary;
 	protected ZSTD_inBuffer inBuff;
 	protected ZSTD_outBuffer outBuff;
 	protected size_t prevOutPos;		///0 if no data left from previous decompression
 	protected ulong compPos, compPos0;	///Current position of data; position of all currently decompressed data
 
-	public pure void delegate(size_t pos) progress;	///Called to inform host on decompression process (will be replaced with something more useful in the future)
+	public void delegate(size_t pos, size_t total) progress;	///Called to inform host on compression or decompression process
+	public void delegate(string filename) currentFile;			///Called to inform host on compression or decompression process
+	public void delegate(uint num, ref string filename) nextFile;	///Called to inform host if next file is needed
 
 	//Configuration area, might be replaced with individual values instead of static ones.
+	public static bool enableSignatureCheck = true;			///If false, then it'll disable throw on file signature mismatch
 	public static bool enableHeaderChecksumError = true;	///If false, then it'll disable throw on header checksum mismatch
 	public static bool enableFileChecksumError = true;		///If false, then it'll disable throw on file checksum mismatch and calculation (useful when dealing with complex hash algorithms not designed for quick checksums)
 	public static size_t readBufferSize = 32 * 1024; ///Sets the read buffer size of all instances (default is 32kB)
 	/**
 	 * Loads a DataPak file from disk for reading.
 	 */
-	public this(string filename){
+	public this(string filename) {
 		this(File(filename));
 		readOnly = true;
 	}
 	///Ditto
-	public this(File f){
+	public this(File f) {
 		CRC32 chkSmCalc = CRC32();
 		ubyte[4] crc;
 		char[] signature;
 		signature.length = SIGNATURE.length;
 		signature = f.rawRead(signature);
-		//check for correct file signature
-		//if(signature != SIGNATURE)
-		foreach(i ,c ; signature)
-			if(SIGNATURE[i] != c)
-				throw new Exception("File isn't DataPak file");
-		chkSmCalc.put(reinterpretCastA!ubyte(signature));
+		if(SIGNATURE != signature && enableSignatureCheck)
+			throw new Exception("File isn't DataPak file");
+		chkSmCalc.put(reinterpretCast!ubyte(signature));
 		readBuf.length = Header.sizeof;
 		readBuf = f.rawRead(readBuf);
 		header = reinterpretGet!Header(readBuf);
-		//ubyte[4] chkSm = header.checksum;
-		//header.checksum = [0x0, 0x0, 0x0, 0x0];
-		//readBuf.length -= 4;
-		//readBuf.length += 4;
 		file = f;
 		chkSmCalc.put(readBuf);
-		initDecomp;
-		if(header.extFieldSize){
-			if(!header.compExtField){
-				extField.length = header.extFieldSize;
-				//f.rawRead(extField);
-				extField = f.rawRead(extField);
-			}else{
-				
-				f.rawRead(crc);
-				extField = decompressFromFile(header.extFieldSize);
-			}
-			chkSmCalc.put(extField);
-		}
-		if(!header.compIndex){
-			indexes.length = header.numOfIndexes;
-			readBuf.length = Index.sizeof;
-			for(int i; i < indexes.length; i++){
-				//fread(readBuf.ptr, readBuf.length, 1, f);
-				readBuf = f.rawRead(readBuf);
-				indexes[i] = reinterpretGet!Index(readBuf);
-				chkSmCalc.put(readBuf);
-				if(indexes[i].extFieldSize){
-					readBuf.length = indexes[i].extFieldSize;
-					readBuf = f.rawRead(readBuf);
-					chkSmCalc.put(readBuf);
-					readBuf.length = Index.sizeof;
-					indexExtFields[i] = readBuf.dup;
-				}
-			}
+		
+		
+		/+if(header.compExtField) {
+			initDecomp;
 			f.rawRead(crc);
-		}else{
-			if(!header.compExtField)
-				f.rawRead(crc);
-			ubyte[] temp = decompressFromFile(cast(size_t)(header.indexSize));
-			ubyte* tempPtr = temp.ptr;
-			chkSmCalc.put(temp);
-			for(int i; i < indexes.length; i++){
-				indexes[i] = *(cast(Index*)(cast(void*)tempPtr));
-				tempPtr += Index.sizeof;
-				if(indexes[i].extFieldSize){
-					indexExtFields[i] = tempPtr[0..indexes[i].extFieldSize].dup;
-					tempPtr += indexes[i].extFieldSize;
-				}
-			}
-		}
+		}+/
+		size_t extFieldRemain = cast(size_t)header.extFieldSize;
+		size_t extFieldNum;
+		while(extFieldRemain) {
+			ubyte[] buffer0, buffer1;
+			buffer0.length = HeaderExt.sizeof;
 
+			buffer0 = f.rawRead(buffer0);
+
+			const HeaderExt extension = reinterpretGet!HeaderExt(buffer0);
+			buffer1.length = extension.size - HeaderExt.sizeof;
+
+			buffer1 = f.rawRead(buffer1);
+			switch (extension.signature) {
+				case StandardExtensions.CompressionDict:
+					dictionary = buffer1;
+					break;
+				case StandardExtensions.ExtCmprDictFile:
+					File dictionaryFile = File(reinterpretCast!char(buffer1).idup);
+					dictionary.length = cast(size_t)dictionaryFile.size;
+					dictionary = dictionaryFile.rawRead(dictionary);
+					break;
+				default:
+					break;
+			}
+			extField[extFieldNum] = buffer0 ~ buffer1;
+
+			chkSmCalc.put(extField[extFieldNum]);
+			extFieldRemain -= extension.size;
+			extFieldNum++;
+		}
+		
+		/+if(header.compIndex) {
+			initDecomp;
+			f.rawRead(crc);
+		}+/
+		indexes.length = header.numOfIndexes;
+		readBuf.length = Index.sizeof;
+		for(uint i; i < indexes.length; i++){
+			/+if(header.compIndex) readBuf = decompressFromFile(readBuf.length);
+			else +/
+			readBuf = f.rawRead(readBuf);
+			
+			indexes[i] = reinterpretGet!Index(readBuf);
+			chkSmCalc.put(readBuf);
+				
+			extFieldRemain = indexes[i].extFieldSize;
+			extFieldNum = 0;
+			while (extFieldRemain){
+				ubyte[] buffer0, buffer1;
+				buffer0.length = IndexExt.sizeof;
+				/+if(header.compIndex) buffer0 = decompressFromFile(buffer0.length);
+				else+/ 
+				buffer0 = f.rawRead(buffer0);
+
+				const IndexExt extension = reinterpretGet!IndexExt(buffer0);
+				buffer1.length = extension.size - IndexExt.sizeof;
+
+				/+if(header.compIndex) buffer1 = decompressFromFile(buffer1.length);
+				else+/ 
+				buffer1 = f.rawRead(buffer1);
+
+				indexExtFields[i][extFieldNum] = buffer0 ~ buffer1;
+				extFieldRemain -= extension.size;
+				extFieldNum++;
+			}
+				
+		}
+		f.rawRead(crc);
+		//initDecomp;
 		const ubyte[4] checksum = chkSmCalc.finish();
 		if(crc != checksum && enableHeaderChecksumError){
 			throw new BadChecksumException("CRC32 error in header/index");
@@ -247,9 +291,10 @@ public class DataPak{
 	/**
 	 * Creates a DataPak file from scratch.
 	 */
-	this(Header header, string targetName, ubyte[] extField = []){
+	this(Header header, string targetName, ubyte[][] extField = null) {
 		file = File(targetName, "wb");
 		this.header = header;
+		this.extField = extField;
 		createNew = true;
 		initComp;
 	}
@@ -257,7 +302,7 @@ public class DataPak{
 		//fclose(file);
 		//deinitialize compression
 		switch(header.compMethod){
-			case CompressionMethod.zstandard:
+			case CompressionMethod.zstandard, CompressionMethod.zstandardWDict:
 				if(createNew){
 					ZSTD_freeCStream(cast(ZSTD_CStream*)compStream);
 				}else{
@@ -270,11 +315,17 @@ public class DataPak{
 				break;
 		}
 	}
+	///Returns true if the file is random-access capable
+	public @property bool randomAccess() const @nogc @safe pure nothrow {
+		if(header.perFileComp) return true;
+		else if(header.compMethod == CompressionMethod.uncompressed) return true;
+		return false;
+	}
 	/**
 	 * Adds a file to be compressed later.
 	 * Returns the created index for it.
 	 */
-	public Index addFile(string filename, string newName = null, ubyte[] indexExtField = []){
+	public Index addFile(string filename, string newName = null, ubyte[][] indexExtField = [][]){
 		Index result;
 		if(!newName.length){
 			newName = filename;
@@ -284,8 +335,7 @@ public class DataPak{
 		ubyte[] buffer;
 		buffer.length = 32*1024;
 		File f = File(filename);
-		result.sizeL = cast(uint)(f.size);
-		result.sizeH = cast(ushort)(f.size>>32);
+		result.uncompSize = f.size;
 		//Calculate checksums if needed
 		size_t remain = cast(size_t)f.size;
 		ubyte[N] _generateChecksum(CHKSM, size_t N)(CHKSM checksum){
@@ -306,39 +356,6 @@ public class DataPak{
 			case ChecksumType.crc64ISO:
 				result.checksum(_generateChecksum!(CRC64ISO, 8)(CRC64ISO()));
 				break;
-			case ChecksumType.md5:
-				result.checksum(_generateChecksum!(MD5, 16)(MD5()));
-				break;
-			case ChecksumType.ripeMD:
-				result.checksum(_generateChecksum!(RIPEMD160, 20)(RIPEMD160()));
-				break;
-			case ChecksumType.sha224:
-				result.checksum(_generateChecksum!(SHA224, 28)(SHA224()));
-				break;
-			case ChecksumType.sha256:
-				result.checksum(_generateChecksum!(SHA256, 32)(SHA256()));
-				break;
-			case ChecksumType.sha384:
-				result.checksum(_generateChecksum!(SHA384, 48)(SHA384()));
-				break;
-			case ChecksumType.sha512:
-				result.checksum(_generateChecksum!(SHA512, 64)(SHA512()));
-				break;
-			case ChecksumType.sha512_224:
-				result.checksum(_generateChecksum!(SHA512_224, 28)(SHA512_224()));
-				break;
-			case ChecksumType.sha512_256:
-				result.checksum(_generateChecksum!(SHA512_256, 32)(SHA512_256()));
-				break;
-			case ChecksumType.murmurhash32_32:
-				result.checksum(_generateChecksum!(MurmurHash3!(32, 32), 4)(MurmurHash3!(32, 32)(0x66_69_6c_65)));
-				break;
-			case ChecksumType.murmurhash128_32:
-				result.checksum(_generateChecksum!(MurmurHash3!(128, 32), 16)(MurmurHash3!(128, 32)(0x66_69_6c_65)));
-				break;
-			case ChecksumType.murmurhash128_64:
-				result.checksum(_generateChecksum!(MurmurHash3!(128, 64), 16)(MurmurHash3!(128, 64)(0x66_69_6c_65_66_69_6c_65L)));
-				break;
 			default:
 				break;
 		}
@@ -348,7 +365,7 @@ public class DataPak{
 		if(indexExtField.length)
 			indexExtFields[cast(uint)indexes.length] = indexExtField;
 		indexes ~= result;
-		header.decompSize += f.size;
+		//header.decompSize += f.size;
 		header.indexSize += Index.sizeof + indexExtField.length;
 		header.numOfIndexes = cast(uint)indexes.length;
 		return result;
@@ -356,19 +373,23 @@ public class DataPak{
 	/**
 	 * Initializes compression.
 	 */
-	protected void initComp(){
+	public void initComp(){
 		if(compStream) return;
 		switch(header.compMethod){
 			case CompressionMethod.uncompressed:
 				break;
-			case CompressionMethod.zstandard:
+			case CompressionMethod.zstandard, CompressionMethod.zstandardWDict:
 				compStream = ZSTD_createCStream();
-				//const size_t result = ZSTD_initCStream(cast(ZSTD_CStream*)compStream, header.compLevel);
 				readBuf.length = readBufferSize;
 				ZSTD_CCtx_reset(cast(ZSTD_CStream*)compStream, ZSTD_ResetDirective.ZSTD_reset_session_only);
 				ZSTD_CCtx_setParameter(cast(ZSTD_CStream*)compStream, ZSTD_cParameter.ZSTD_c_compressionLevel, header.compLevel);
+				if (header.compMethod == CompressionMethod.zstandardWDict) {
+					size_t errCode = ZSTD_CCtx_loadDictionary(cast(ZSTD_CStream*)compStream, dictionary.ptr, dictionary.length);
+					if (ZSTD_isError(errCode)) {
+						throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(errCode))));
+					}
+				}
 				inBuff = ZSTD_inBuffer(readBuf.ptr, readBuf.length, 0);
-				//compBuf.length = ZSTD_CStreamOutSize();
 				compBuf.length = readBufferSize;
 				outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
 				break;
@@ -389,19 +410,22 @@ public class DataPak{
 	/**
 	 * Initializes decompression.
 	 */
-	protected void initDecomp(){
+	public void initDecomp(){
 		if(compStream) return;
 		switch(header.compMethod){
 			case CompressionMethod.uncompressed:
 				break;
-			case CompressionMethod.zstandard:
+			case CompressionMethod.zstandard, CompressionMethod.zstandardWDict:
 				compStream = ZSTD_createDStream();
 				ZSTD_initDStream(cast(ZSTD_DStream*)compStream);
-				//writeln(result);
 				readBuf.length = readBufferSize;
 				inBuff = ZSTD_inBuffer(readBuf.ptr, readBuf.length, 0);
-				//compBuf.length = ZSTD_DStreamOutSize();
-				//outBuff = ZSTD_outBuffer(compBuf.ptr, compBuf.length, 0);
+				if (header.compMethod == CompressionMethod.zstandardWDict){
+					size_t errCode = ZSTD_DCtx_loadDictionary(cast(ZSTD_DCtx*)compStream, dictionary.ptr, dictionary.length);
+					if (ZSTD_isError(errCode)) {
+						throw new CompressionException(cast(string)(fromStringz(ZSTD_getErrorName(errCode))));
+					}
+				}
 				break;
 			case CompressionMethod.deflate:
 				if(zlib.Z_OK != zlib.inflateInit(&deflateStream))
@@ -417,39 +441,46 @@ public class DataPak{
 	/**
 	 * Returns a given index.
 	 */
-	public Index getIndex(uint i){
-		if(i >= indexes.length)
-			return Index.init;
-		else
-			return indexes[i];
+	public Index getIndex(uint i) {
+		if (i < indexes.length) return indexes[i];
+		else return Index.init;
 	}
 	/**
 	 * Returns the index of next file.
 	 */
-	public Index getNextIndex(){
-		if(nextIndex >= indexes.length)
-			return Index.init;
-		else
-			return indexes[nextIndex];
+	public Index getNextIndex() {
+		if (nextIndex < indexes.length) return indexes[nextIndex];
+		else return Index.init;
+	}
+	/**
+	 * Sets the index to a given point if the Datapak is random accessible.
+	 */
+	public Index setIndex(uint i) {
+		if (this.randomAccess) {
+			if (i < indexes.length) {
+				nextIndex = i;
+				return indexes[i];
+			} else {
+				return Index.init;
+			}
+		} else throw new UnsupportedAccessModeException("Random access is not supported with this ");
 	}
 	/**
 	 * Returns the next file as a VFile.
 	 */
-	/+public VFile getNextAsVFile(){
-		VFile result = VFile.__ctor!ubyte(getNextAsArray);
+	public VFile getNextAsVFile(){
+		VFile result = VFile(getNextAsArray(), "");
 		return result;
-	}+/
+	}
 	/**
 	 * Returns the next file as an ubyte[] array.
 	 */
 	public ubyte[] getNextAsArray(){
 		if(nextIndex >= indexes.length)
-			return [];
-		static if(size_t.sizeof == 4)
-			ubyte[] result = decompressFromFile(indexes[nextIndex].sizeL);
-		else{
-			ubyte[] result = decompressFromFile(cast(ulong)indexes[nextIndex].sizeL | cast(ulong)indexes[nextIndex].sizeH<<32);
-		}
+		return [];
+		
+		ubyte[] result = decompressFromFile(cast(size_t)(indexes[nextIndex].uncompSize));
+		
 
 		nextIndex++;
 		return result;
@@ -467,34 +498,12 @@ public class DataPak{
 				return false;
 		}
 		switch(header.checksumType){
-			case ChecksumType.ripeMD:
-				return _checkFile(RIPEMD160());
-			case ChecksumType.md5:
-				return _checkFile(MD5());
 			case ChecksumType.crc32:
 				return _checkFile(CRC32());
 			case ChecksumType.crc64ISO:
 				return _checkFile(CRC64ISO());
 			case ChecksumType.crc64ECMA:
 				return _checkFile(CRC64ECMA());
-			case ChecksumType.sha224:
-				return _checkFile(SHA224());
-			case ChecksumType.sha256:
-				return _checkFile(SHA256());
-			case ChecksumType.sha384:
-				return _checkFile(SHA384());
-			case ChecksumType.sha512:
-				return _checkFile(SHA512());
-			case ChecksumType.sha512_224:
-				return _checkFile(SHA512_224());
-			case ChecksumType.sha512_256:
-				return _checkFile(SHA512_256());
-			case ChecksumType.murmurhash32_32:
-				return _checkFile(MurmurHash3!(32,32)(0x66_69_6c_65));
-			case ChecksumType.murmurhash128_32:
-				return _checkFile(MurmurHash3!(128,32)(0x66_69_6c_65));
-			case ChecksumType.murmurhash128_64:
-				return _checkFile(MurmurHash3!(128,64)(0x66_69_6c_65_66_69_6c_65L));
 			default:
 				return true;
 		}
@@ -505,25 +514,33 @@ public class DataPak{
 	public void finalize(){
 		CRC32 chkSmCalc = CRC32();
 		file.rawWrite(SIGNATURE);
-		chkSmCalc.put(reinterpretCast!ubyte(SIGNATURE));
+		chkSmCalc.put(reinterpretCast!ubyte(SIGNATURE.dup));
 		file.rawWrite([header]);
-		chkSmCalc.put(reinterpretCast!ubyte(header));
-		if(!header.compIndex && !header.compExtField){
-			if(extField.length)
-				file.rawWrite(extField);
-				chkSmCalc.put(extField);
-			foreach(n, i; indexes){
-				file.rawWrite([i]);
-				chkSmCalc.put(reinterpretCast!ubyte(i));
-				if(indexExtFields.get(cast(uint)n, null) !is null){
-					file.rawWrite(indexExtFields[cast(uint)n]);
-					chkSmCalc.put(indexExtFields[cast(uint)n]);
-				}
+		chkSmCalc.put(reinterpretAsArray!ubyte(header));
+		
+		
+		foreach (extension ; extField) {
+			if (extension.length) {
+				file.rawWrite(extension);
+				chkSmCalc.put(extension);
 			}
-			const ubyte[4] checksum = chkSmCalc.finish;
-			file.rawWrite(checksum);
-		}else
-			throw new Exception("Feature not yet implemented");
+		}
+		foreach (n, i; indexes) {
+			file.rawWrite([i]);
+			chkSmCalc.put(reinterpretAsArray!ubyte(i));
+			if(indexExtFields.get(cast(uint)n, null) !is null){
+				foreach (extension ; indexExtFields[cast(uint)n]) {
+					if (extension.length) {
+						file.rawWrite(extension);
+						chkSmCalc.put(extension);
+					}
+				}
+				//chkSmCalc.put(indexExtFields[cast(uint)n]);
+			}
+		}
+		const ubyte[4] checksum = chkSmCalc.finish;
+		file.rawWrite(checksum);
+		
 		//write each files in order of access
 		foreach(n, i; indexes){
 			this.compress(i.filename, i);
@@ -725,117 +742,9 @@ public class DataPak{
 unittest{
 	DataPak.Index index;
 	index.filename = "something";
-	writeln(index.field);
-	assert(index.filename == "something");
-}
-/**
- * Default extension for adding general support for using it as a regular file archival tool.
- * This does not contain user-privilege settings, those will be relegated to another struct. 
- */
-struct DataPak_OSExt {
-align(1):
-	char[6]		id = "OSExt ";			///Identifies that this field is a DataPak_OSExt struct
-	ushort		size = DataPak_OSExt.sizeof;	///Size of this field
-	char[200]	nameExt;				///Stores filename extension + relative path
-	ulong		creationDate;			///Creation date in 64 bit POSIX time format
-	ulong		modifyDate;				///Modification date in 64 bit POSIX time format
-	ulong		field;					///Unused by default, can store attributes if needed
-	///Sets the name extension of the file
-	public string name(string val) @safe @property @nogc nothrow pure{
-		for (size_t i ; i < nameExt.length ; i++)
-			nameExt[i] = 0xFF;
-		foreach (i , c ; val)
-			nameExt[i] = c;
-		return val;
-	}
-	///Gets the name extension of the file
-	public string name() @safe @property nothrow pure{
-		string result;
-		size_t pos;
-		while(nameExt.length > pos && nameExt[pos] != 0xFF){
-			result ~= nameExt[pos];
-			pos++;
-		}
-		return result;
-	}
-}
-/**
- * Default extension for adding support for compression algorithms that support random access
- */
-struct DataPak_RandomAccessExt{
-align(1):
-	char[6]		id = "RandAc";			///Identifies that this field is a DataPak_RandomAccessExt struct
-	ushort		size = DataPak_RandomAccessExt.sizeof;	///Size of this field
-	ulong		position;				///Position of file
-	union{
-		ulong[2]	field64;
-		uint[4]		field32;
-		ushort[8]	field16;
-		ubyte[16]	field8;
-	}
-}
-/**
- * Reinterprets an array as the requested type.
- */
-package T[] reinterpretCastA(T,U)(U[] input) pure @trusted{
-	T[] _reinterpretCastA() pure @system{
-		return cast(T[])(cast(void[])input);
-	}
-	if ((U.sizeof * input.length) % T.sizeof == 0)
-		return _reinterpretCastA();
-	else
-		throw new Exception("Reinterpretation error!");
-}
-/**
- * Reinterprets an array as the requested type.
- */
-package T[] reinterpretCast(T,U)(U input) pure @trusted{
-	T[] _reinterpretCast() pure @system{
-		return cast(T[])(cast(void[])[input]);
-	}
-	if (U.sizeof % T.sizeof == 0)
-		return _reinterpretCast();
-	else
-		throw new Exception("Reinterpretation error!");
-	
-}
-/**
- * Gets a certain type from an array.
- */
-package T reinterpretGet(T,U)(U[] input) pure @trusted{
-	T _reinterpretGet() pure @system{
-		return *(cast(T*)(cast(void*)input.ptr));
-	}
-	if (input.length == T.sizeof)
-		return _reinterpretGet();
-	else
-		throw new Exception("Reinterpretation error!");
-}
-/**
- * Thrown on checksum errors
- */
-public class BadChecksumException : Exception{
-	@nogc @safe pure nothrow this(string msg, string file = __FILE__, size_t line = __LINE__, Throwable nextInChain = null)
-    {
-        super(msg, file, line, nextInChain);
-    }
-
-    @nogc @safe pure nothrow this(string msg, Throwable nextInChain, string file = __FILE__, size_t line = __LINE__)
-    {
-        super(msg, file, line, nextInChain);
-    }
-}
-/**
- * Thrown on compression errors
- */
-public class CompressionException : Exception{
-	@nogc @safe pure nothrow this(string msg, string file = __FILE__, size_t line = __LINE__, Throwable nextInChain = null)
-    {
-        super(msg, file, line, nextInChain);
-    }
-
-    @nogc @safe pure nothrow this(string msg, Throwable nextInChain, string file = __FILE__, size_t line = __LINE__)
-    {
-        super(msg, file, line, nextInChain);
-    }
+	assert(index.filename == "something", index.filename);
+	index.checksum!4 = [2,7,4,7];
+	assert(index.checksum!4 == [2,7,4,7]);
+	index.checksum!8 = [1,2,3,4,5,6,7,8];
+	assert(index.checksum!8 == [1,2,3,4,5,6,7,8]);
 }
