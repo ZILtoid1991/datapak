@@ -24,15 +24,14 @@ import bitleveld.reinterpret;
  * Standard extensions can give these functionalities back.
  * 
  * General layout of a file:
- * <ul>
- * <li>DataPak signature</li>
- * <li>Header</li>
- * <li>Extension area. Certain extensions might help decompress the file (e.g. decompression dictionaries), everything else is ignored
- * here by default, and the end user must implement handling of them.</li>
- * <li>Array of DataPak indexes. Each entry can have some extension. Can be compressed alongside with the main data to save some space.</li>
- * <li>CRC32 checksum at the begining of compressed block or at the end of file information description table.</li>
- * <li>Data</li>
- * </ul>
+ * 
+ * * DataPak signature
+ * * Header
+ * * Extension area. Certain extensions might help decompress the file (e.g. decompression dictionaries), everything else is ignored
+ * here by default, and the end user must implement handling of them.
+ * * Array of DataPak indexes. Each entry can have some extension. Can be compressed alongside with the main data to save some space.
+ * * CRC32 checksum at the begining of compressed block or at the end of file information description table.
+ * * Data chunks
  */
 public class DataPak {
 	///Every DataPak file begins with this.
@@ -41,7 +40,7 @@ public class DataPak {
 	///Standard extensions recognized by the format.
 	enum StandardExtensions : char[8] {
 		CompressionDict		=	"CMPRDICT",
-		ExtCmprDictFile		=	"CMPRDEXF"
+		ExtCmprDictFile		=	"CMPRDIxf"
 	}
 	/**
 	 * Default compression methods for the file.
@@ -298,6 +297,23 @@ public class DataPak {
 		createNew = true;
 		initComp;
 	}
+	/** 
+	 * 
+	 * Params:
+	 *   compMethod = 
+	 *   targetName = 
+	 *   extField = 
+	 */
+	this(char[8] compMethod, string targetName, ubyte[][] extField = null) {
+		file = File(targetName, "wb");
+		this.header = Header(0, compMethod, 0, 0);
+		foreach (ubyte[] key; extField) {
+			this.header.extFieldSize += key.length;
+		}
+		this.extField = extField;
+		createNew = true;
+		initComp;
+	}
 	~this(){
 		//fclose(file);
 		//deinitialize compression
@@ -325,16 +341,13 @@ public class DataPak {
 	 * Adds a file to be compressed later.
 	 * Returns the created index for it.
 	 */
-	public Index addFile(string filename, string newName = null, ubyte[][] indexExtField = [][]){
+	public Index addFile(string filename, string path, ubyte[][] indexExtField = [][]){
 		Index result;
-		if(!newName.length){
-			newName = filename;
-		}
-		result.filename = newName;
+		result.filename = filename;
 
 		ubyte[] buffer;
 		buffer.length = 32*1024;
-		File f = File(filename);
+		File f = File(path);
 		result.uncompSize = f.size;
 		//Calculate checksums if needed
 		size_t remain = cast(size_t)f.size;
@@ -365,6 +378,7 @@ public class DataPak {
 		if(indexExtField.length)
 			indexExtFields[cast(uint)indexes.length] = indexExtField;
 		indexes ~= result;
+		paths ~= path;
 		//header.decompSize += f.size;
 		header.indexSize += Index.sizeof + indexExtField.length;
 		header.numOfIndexes = cast(uint)indexes.length;
@@ -542,8 +556,8 @@ public class DataPak {
 		file.rawWrite(checksum);
 		
 		//write each files in order of access
-		foreach(n, i; indexes){
-			this.compress(i.filename, i);
+		foreach(size_t n, Index i; indexes){
+			this.compress(paths[n], i);
 		}
 		switch (header.compMethod) {
 			case CompressionMethod.zstandard:
@@ -634,6 +648,8 @@ public class DataPak {
 				
 				outBuff.pos = 0;
 				
+				break;
+			case CompressionMethod.zstandardWDict:
 				break;
 			case CompressionMethod.deflate:
 				readBuf.length = readBufferSize;
@@ -739,7 +755,11 @@ public class DataPak {
 	}
 }
 
-unittest{
+public ubyte[] createExtension(T)(T header, ubyte[] data) {
+	return reinterpretAsArray!ubyte(header) ~ data;
+}
+
+unittest {
 	DataPak.Index index;
 	index.filename = "something";
 	assert(index.filename == "something", index.filename);
@@ -747,4 +767,15 @@ unittest{
 	assert(index.checksum!4 == [2,7,4,7]);
 	index.checksum!8 = [1,2,3,4,5,6,7,8];
 	assert(index.checksum!8 == [1,2,3,4,5,6,7,8]);
+}
+unittest {
+	DataPak dpkOut = new DataPak(DataPak.CompressionMethod.deflate, "test.dpk");
+	dpkOut.addFile("./libzstd.dll", "libzstd.a");
+	dpkOut.addFile("./zstd.exe", "zstd.a");
+	dpkOut.addFile("./LICENSE", "LICENSE.a");
+
+	dpkOut.finalize();
+
+	DataPak dpkIn = new DataPak("test.dpk");
+	//dpkIn.getNextAsArray();
 }

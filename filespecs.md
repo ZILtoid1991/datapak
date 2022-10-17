@@ -69,7 +69,7 @@ use any compression, zero if the Datapak is compressed at once (no random access
 end as binary. Note that very-long hash-codes or checksums severely limiy the lenght of the filename, unless extensions are 
 used. At least one 0x00 character must be between the hash/checksum field and the filename.
 
-Max size of a file can be 2^48 - 1 bytes, or almost 262_144 gigabytes. If this ever becomes too small, chaining could be enabled.
+Max size of a file can be 2^64 - 1 bytes.
 
 ### Index extensions
 
